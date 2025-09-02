@@ -97,6 +97,7 @@ static Uint32 Colours[NCOLOURS];	/* Display format colours */
 SDL_Window *TheWindow;			/* The display window. */
 SDL_Renderer *TheRenderer;		/* The renderer. */
 SDL_Surface *TheSurf;			/* The display surface. */
+SDL_Texture *TheTexture;		/* The main texture for rendering. */
 
 typedef struct VMode_st {		/* Video mode info */
     Uint16 w;				/* width */
@@ -895,7 +896,11 @@ set_VMode(VMode* m)
 {
     Uint32 window_flags = m->flags;
     
-    /* Clean up previous window and renderer */
+    /* Clean up previous resources */
+    if (TheTexture) {
+        SDL_DestroyTexture(TheTexture);
+        TheTexture = NULL;
+    }
     if (TheRenderer) {
         SDL_DestroyRenderer(TheRenderer);
         TheRenderer = NULL;
@@ -928,17 +933,47 @@ set_VMode(VMode* m)
         return NULL;
     }
 
-    /* Create surface for compatibility with existing code */
-    TheSurf = SDL_CreateRGBSurface(0, m->w, m->h, 32, 
-                                   0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
-    
-    if (!TheSurf) {
+    /* Get the renderer's preferred texture format */
+    SDL_RendererInfo renderer_info;
+    if (SDL_GetRendererInfo(TheRenderer, &renderer_info) != 0) {
         SDL_DestroyRenderer(TheRenderer);
         SDL_DestroyWindow(TheWindow);
         TheRenderer = NULL;
         TheWindow = NULL;
         return NULL;
     }
+    
+    /* Use the first supported format, or default to RGBA8888 */
+    Uint32 format = (renderer_info.num_texture_formats > 0) ? 
+                    renderer_info.texture_formats[0] : SDL_PIXELFORMAT_RGBA8888;
+    
+    /* Create texture for rendering */
+    TheTexture = SDL_CreateTexture(TheRenderer, format, 
+                                   SDL_TEXTUREACCESS_STREAMING, m->w, m->h);
+    if (!TheTexture) {
+        SDL_DestroyRenderer(TheRenderer);
+        SDL_DestroyWindow(TheWindow);
+        TheRenderer = NULL;
+        TheWindow = NULL;
+        return NULL;
+    }
+    
+    /* Create surface compatible with the texture format */
+    TheSurf = SDL_CreateRGBSurfaceWithFormat(0, m->w, m->h, 
+                                            SDL_BITSPERPIXEL(format), format);
+    
+    if (!TheSurf) {
+        SDL_DestroyTexture(TheTexture);
+        SDL_DestroyRenderer(TheRenderer);
+        SDL_DestroyWindow(TheWindow);
+        TheTexture = NULL;
+        TheRenderer = NULL;
+        TheWindow = NULL;
+        return NULL;
+    }
+    
+    /* Clear the surface to eliminate any garbage data */
+    SDL_FillRect(TheSurf, NULL, SDL_MapRGB(TheSurf->format, 0, 0, 0));
 
     /* Update VMode with what we actually got */
     {
@@ -985,17 +1020,25 @@ clear_display(void)
 #endif
 
 
+/* Update the texture from surface and render to screen */
+static void
+update_texture_and_render(const SDL_Rect *src_rect)
+{
+    if (!TheTexture || !TheSurf || !TheRenderer) return;
+    
+    /* Always do full texture update - partial updates are unreliable */
+    SDL_UpdateTexture(TheTexture, NULL, TheSurf->pixels, TheSurf->pitch);
+    
+    /* Clear and render the entire texture */
+    SDL_RenderClear(TheRenderer);
+    SDL_RenderCopy(TheRenderer, TheTexture, NULL, NULL);
+    SDL_RenderPresent(TheRenderer);
+}
+
 static void
 refresh_rect(const SDL_Rect *r)
 {
-    /* In SDL2, we use the renderer to update the display */
-    SDL_Texture* texture = SDL_CreateTextureFromSurface(TheRenderer, TheSurf);
-    if (texture) {
-        SDL_Rect dst_rect = *r;
-        SDL_RenderCopy(TheRenderer, texture, r, &dst_rect);
-        SDL_RenderPresent(TheRenderer);
-        SDL_DestroyTexture(texture);
-    }
+    update_texture_and_render(r);
 }
 
 /* ------------------------------------------------------------------------
@@ -2905,15 +2948,7 @@ redraw(void)
     Layout *root = get_root_layout(CoreLayout);
     redraw_layout(root);
     /* Update renderer from surface and present */
-{
-    SDL_Texture* texture = SDL_CreateTextureFromSurface(TheRenderer, TheSurf);
-    if (texture) {
-        SDL_RenderClear(TheRenderer);
-        SDL_RenderCopy(TheRenderer, texture, NULL, NULL);
-        SDL_RenderPresent(TheRenderer);
-        SDL_DestroyTexture(texture);
-    }
-}
+    update_texture_and_render(NULL);
 }
 
 /* Layout everything into a display of size W by H pixels, enlarging the
@@ -3308,15 +3343,7 @@ default_handler(SDL_Event *e)
 #endif
         }
         /* Update renderer from surface and present */
-        {
-            SDL_Texture* texture = SDL_CreateTextureFromSurface(TheRenderer, TheSurf);
-            if (texture) {
-                SDL_RenderClear(TheRenderer);
-                SDL_RenderCopy(TheRenderer, texture, NULL, NULL);
-                SDL_RenderPresent(TheRenderer);
-                SDL_DestroyTexture(texture);
-            }
-        }
+        update_texture_and_render(NULL);
         break;
     case SDL_QUIT:
         sdlgr_display_close(WAIT);
