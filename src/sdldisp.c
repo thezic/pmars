@@ -94,6 +94,8 @@ static Uint32 Colours[NCOLOURS];	/* Display format colours */
 
 /*-- The display --*/
 
+SDL_Window *TheWindow;			/* The display window. */
+SDL_Renderer *TheRenderer;		/* The renderer. */
 SDL_Surface *TheSurf;			/* The display surface. */
 
 typedef struct VMode_st {		/* Video mode info */
@@ -106,7 +108,7 @@ typedef struct VMode_st {		/* Video mode info */
 VMode TheVMode;				/* Current video mode. */
 
 #define NUM_VMODE_FLAGS 5
-#define DEFAULT_VMODE_FLAGS (SDL_RESIZABLE | SDL_SWSURFACE);
+#define DEFAULT_VMODE_FLAGS (SDL_WINDOW_RESIZABLE);
 #define DEFAULT_VMODE_W 640
 #define DEFAULT_VMODE_H 480
 #define DEFAULT_VMODE_BPP 0
@@ -115,11 +117,11 @@ static struct {
     size_t siglen;			/* # significant chars */
     Uint32 value;			/* bitmask of flags to set or clear. */
 } const VMode_flags[NUM_VMODE_FLAGS] = {
-    { "fullscreen",	1, SDL_FULLSCREEN },
-    { "resizable",	1, SDL_RESIZABLE },
-    { "any",		1, SDL_ANYFORMAT },
-    { "noframe",	1, SDL_NOFRAME },
-    { "db",		1, SDL_DOUBLEBUF }
+    { "fullscreen",	1, SDL_WINDOW_FULLSCREEN },
+    { "resizable",	1, SDL_WINDOW_RESIZABLE },
+    { "any",		1, 0 },  /* SDL_ANYFORMAT no longer exists */
+    { "noframe",	1, SDL_WINDOW_BORDERLESS },
+    { "db",		1, 0 }  /* SDL_DOUBLEBUF handled differently in SDL2 */
 };
 
 
@@ -560,8 +562,8 @@ static void close_text_panel (int panel);
 
 /* Events and keyboard input. */
 static void default_handler (SDL_Event *e);
-static char conv_key (const SDL_keysym *s);
-static int macro_key (const SDL_keysym *s, char *buf, int maxbuf);
+static char conv_key (const SDL_Keysym *s);
+static int macro_key (const SDL_Keysym *s, char *buf, int maxbuf);
 
 /* Command History */
 static Cmd * get_cmd_ring();
@@ -569,9 +571,9 @@ static void add_cmd (const char *cmd);
 
 /* Events & keyboard. */
 static void default_handler (SDL_Event *e);
-static int special_keyhandler (const SDL_keysym *s);
-static char conv_key (const SDL_keysym *s);
-static int macro_key (const SDL_keysym *s, char *buf, int maxbuf);
+static int special_keyhandler (const SDL_Keysym *s);
+static char conv_key (const SDL_Keysym *s);
+static int macro_key (const SDL_Keysym *s, char *buf, int maxbuf);
 
 /* Misc. */
 static void exit_hook (void);
@@ -815,7 +817,8 @@ decode_vmode_string(VMode *m, const char *str)
     if (*str==':') { str++; }		/* skip over ':' */
 
     /* Decode flags separated by ':' and optionally preceded by '-'. */
-    if (m->bpp == 0) { m->flags |= SDL_ANYFORMAT; }
+    /* SDL_ANYFORMAT not needed in SDL2 */
+    if (m->bpp == 0) { /* Use default BPP */ }
 
     while (*str) {
 	int i;
@@ -845,29 +848,15 @@ decode_vmode_string(VMode *m, const char *str)
 
     /* If the user didn't set the dimensions and requested fullscreen mode,
      * we should find the biggest fullscreen mode available and use that.
-     * In case no modes are available, or "all" modes are ok, use the defaults.
+     * In case no modes are available, use the defaults.
      */
-    if (!set_dims && ((m->flags & SDL_FULLSCREEN)==SDL_FULLSCREEN)) {
-	SDL_Rect **modes;
-	modes = SDL_ListModes(NULL, SDL_FULLSCREEN);
-	if (modes == NULL || modes==(SDL_Rect**)(-1)) {
-	    /* Use defaults that are set already. */
-	} else {
-	    /* Find the biggest fullscreen mode. */
-	    int i, bigix = -1;
-	    double bigsize = 0;
-	    for (i=0; modes[i]; i++) {
-		double size = (double)modes[i]->w*modes[i]->h;
-		if (size>bigsize) {
-		    bigsize = size;
-		    bigix = i;
-		}
-	    }
-	    if (bigix>=0) {
-		m->w = modes[bigix]->w;
-		m->h = modes[bigix]->h;
-	    }
-	}
+    if (!set_dims && ((m->flags & SDL_WINDOW_FULLSCREEN)==SDL_WINDOW_FULLSCREEN)) {
+        SDL_DisplayMode mode;
+        if (SDL_GetCurrentDisplayMode(0, &mode) == 0) {
+            m->w = mode.w;
+            m->h = mode.h;
+        }
+        /* Use defaults if we can't get display mode */
     }
 
     return 0;				/* all ok. */
@@ -904,68 +893,79 @@ Sunlock(SDL_Surface *screen)
 static SDL_Surface *
 set_VMode(VMode* m)
 {
-    SDL_Surface *surf = NULL;
-    Uint32 flags = m->flags;
-
-    if ((flags & SDL_FULLSCREEN) == SDL_FULLSCREEN) { /* only in fullscreen. */
-	const SDL_VideoInfo *info = SDL_GetVideoInfo();
-	if ( info->blit_fill ) {
-	    /* We want accelerated blitting. */
-	    flags |= SDL_HWSURFACE;
-	}
-	if ((flags & SDL_HWSURFACE) == SDL_HWSURFACE) {
-	    /* Direct hardware blitting without double-buffering
-	     * causes really bad flickering.
-	     */
-	    if ( m->bpp>0
-		 && info->video_mem*1024 > (Uint32)(m->h*m->w*m->bpp/8) )
-	    {
-		flags |= SDL_DOUBLEBUF;
-	    } else {
-		flags &= ~SDL_HWSURFACE;
-	    }
-	}
-	if ((flags & SDL_HWSURFACE) == SDL_HWSURFACE) {
-	    flags &=~ SDL_ANYFORMAT;
-	}
-    }
+    Uint32 window_flags = m->flags;
     
-    if (!(surf = SDL_SetVideoMode(m->w, m->h, m->bpp, flags))
-	&& flags != m->flags)
-    {
-	flags = m->flags;		/* try with original flags. */
-	surf = SDL_SetVideoMode(m->w, m->h, m->bpp, flags);
+    /* Clean up previous window and renderer */
+    if (TheRenderer) {
+        SDL_DestroyRenderer(TheRenderer);
+        TheRenderer = NULL;
     }
-    m->flags = flags;
+    if (TheWindow) {
+        SDL_DestroyWindow(TheWindow);
+        TheWindow = NULL;
+    }
+    if (TheSurf) {
+        SDL_FreeSurface(TheSurf);
+        TheSurf = NULL;
+    }
 
-    /* Update VMode with the one we actually got. */
-    TheSurf = surf;
-    if (surf) {
-	m->flags = surf->flags;
-	m->w = surf->w;
-	m->h = surf->h;
-	m->bpp = surf->format->BitsPerPixel;
+    /* Create SDL2 window */
+    TheWindow = SDL_CreateWindow("pMARS", 
+                                 SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                 m->w, m->h, window_flags);
+    
+    if (!TheWindow) {
+        return NULL;
+    }
 
-	/* Set the caption on our window.
-	 */
-	SDL_WM_SetCaption("pMARS", "pMARS");
+    /* Create renderer */
+    TheRenderer = SDL_CreateRenderer(TheWindow, -1, 
+                                    SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    
+    if (!TheRenderer) {
+        SDL_DestroyWindow(TheWindow);
+        TheWindow = NULL;
+        return NULL;
+    }
+
+    /* Create surface for compatibility with existing code */
+    TheSurf = SDL_CreateRGBSurface(0, m->w, m->h, 32, 
+                                   0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
+    
+    if (!TheSurf) {
+        SDL_DestroyRenderer(TheRenderer);
+        SDL_DestroyWindow(TheWindow);
+        TheRenderer = NULL;
+        TheWindow = NULL;
+        return NULL;
+    }
+
+    /* Update VMode with what we actually got */
+    {
+        int w, h;
+        SDL_GetWindowSize(TheWindow, &w, &h);
+        m->w = w;
+        m->h = h;
+        m->bpp = TheSurf->format->BitsPerPixel;
+    }
+
 #if 0
-	printf("%dx%d@%d:%x\n", m->w, m->h, m->bpp, m->flags);
+    printf("%dx%d@%d:%x\n", m->w, m->h, m->bpp, m->flags);
 #endif
 
-	/* Map the colours we will use into display-native format. */
-	{
-	    int k;
-	    for (k=0; k<NCOLOURS; k++) {
-		RGBColour c = PaletteRGB[k];
-		Colours[k] = SDL_MapRGB(surf->format, c.r, c.g, c.b);
-	    }
-	}
-
-	/* Initialise the font for the colours we will use. */
-	Font_Init(&CurrentFont, fnt16_raw, 8, 16, 128);
+    /* Map the colours we will use into display-native format. */
+    {
+        int k;
+        for (k=0; k<NCOLOURS; k++) {
+            RGBColour c = PaletteRGB[k];
+            Colours[k] = SDL_MapRGB(TheSurf->format, c.r, c.g, c.b);
+        }
     }
-    return surf;
+
+    /* Initialise the font for the colours we will use. */
+    Font_Init(&CurrentFont, fnt16_raw, 8, 16, 128);
+    
+    return TheSurf;
 }
 
 
@@ -988,7 +988,14 @@ clear_display(void)
 static void
 refresh_rect(const SDL_Rect *r)
 {
-    SDL_UpdateRect(TheSurf, r->x, r->y, r->w, r->h);
+    /* In SDL2, we use the renderer to update the display */
+    SDL_Texture* texture = SDL_CreateTextureFromSurface(TheRenderer, TheSurf);
+    if (texture) {
+        SDL_Rect dst_rect = *r;
+        SDL_RenderCopy(TheRenderer, texture, r, &dst_rect);
+        SDL_RenderPresent(TheRenderer);
+        SDL_DestroyTexture(texture);
+    }
 }
 
 /* ------------------------------------------------------------------------
@@ -1046,7 +1053,7 @@ Font_Init(FixedFontInfo *f, const Uint8* bitmaps, Uint16 w, Uint16 h, Uint16 nch
 	int c;
 	Uint32 col;
 	SDL_Surface *s;
-	s = SDL_CreateRGBSurface(SDL_ANYFORMAT, w*nchars, h,
+	s = SDL_CreateRGBSurface(0, w*nchars, h,
 				 TheSurf->format->BitsPerPixel,
 				 TheSurf->format->Rmask,
 				 TheSurf->format->Gmask,
@@ -1089,7 +1096,7 @@ Font_Init(FixedFontInfo *f, const Uint8* bitmaps, Uint16 w, Uint16 h, Uint16 nch
 	Sunlock(s);
 
 	/* Convert glyphs to video format. */
-	f->glyphs[i] = SDL_DisplayFormat(s);
+	f->glyphs[i] = SDL_ConvertSurface(s, TheSurf->format, 0);
 	SDL_FreeSurface(s);
 	if (f->glyphs[i] == NULL) {
 	    exit_panic(errSpriteConv, SDL_GetError());
@@ -2613,7 +2620,7 @@ make_blitbox(Arena *a, int colix, Uint32 boxes)
     int bs = a->cell.box_size;
     int ibsp = a->cell.interbox_space;
 
-    sprite = SDL_CreateRGBSurface(SDL_ANYFORMAT, cellsize, cellsize,
+    sprite = SDL_CreateRGBSurface(0, cellsize, cellsize,
 				  TheSurf->format->BitsPerPixel,
 				  TheSurf->format->Rmask,
 				  TheSurf->format->Gmask,
@@ -2625,7 +2632,7 @@ make_blitbox(Arena *a, int colix, Uint32 boxes)
 
     /* Set colorkey (=black) for the sprite. */
     key = SDL_MapRGB(sprite->format, 0, 0, 0);
-    if (-1==SDL_SetColorKey(sprite, SDL_SRCCOLORKEY | SDL_RLEACCEL, key)) {
+    if (-1==SDL_SetColorKey(sprite, SDL_TRUE, key)) {
 	exit_panic(errSpriteColKey, SDL_GetError());
     }
 
@@ -2650,7 +2657,7 @@ make_blitbox(Arena *a, int colix, Uint32 boxes)
     }
 
     /* Convert sprite to video format. */
-    temp = SDL_DisplayFormat(sprite);
+    temp = SDL_ConvertSurface(sprite, TheSurf->format, 0);
     SDL_FreeSurface(sprite);
     if (temp == NULL) {
        exit_panic(errSpriteConv, SDL_GetError());
@@ -2897,7 +2904,16 @@ redraw(void)
 {
     Layout *root = get_root_layout(CoreLayout);
     redraw_layout(root);
-    SDL_Flip(TheSurf);
+    /* Update renderer from surface and present */
+{
+    SDL_Texture* texture = SDL_CreateTextureFromSurface(TheRenderer, TheSurf);
+    if (texture) {
+        SDL_RenderClear(TheRenderer);
+        SDL_RenderCopy(TheRenderer, texture, NULL, NULL);
+        SDL_RenderPresent(TheRenderer);
+        SDL_DestroyTexture(texture);
+    }
+}
 }
 
 /* Layout everything into a display of size W by H pixels, enlarging the
@@ -3269,7 +3285,7 @@ add_cmd(const char *cmd)
  */
 #define any_set(bits,mask)  (((bits)&(mask))!=0)
 
-/* Handle VIDEORESIZE, VIDEOEXPOSE, and QUIT events. */
+/* Handle WINDOWEVENT, and QUIT events. */
 static void
 default_handler(SDL_Event *e)
 {
@@ -3278,32 +3294,45 @@ default_handler(SDL_Event *e)
     static int nvideoexpose_events = 0;
 #endif
     switch (e->type) {
-    case SDL_VIDEORESIZE:
-	relayout(e->resize.w, e->resize.h);
-	SDL_Flip(TheSurf);
-	break;
-    case SDL_VIDEOEXPOSE:
+    case SDL_WINDOWEVENT:
+        if (e->window.event == SDL_WINDOWEVENT_RESIZED) {
+            relayout(e->window.data1, e->window.data2);
+        }
+        else if (e->window.event == SDL_WINDOWEVENT_EXPOSED) {
 #ifdef WIN32
-	if (++nvideoexpose_events > 1) {
-	    redraw();
-	}
+            if (++nvideoexpose_events > 1) {
+                redraw();
+            }
+#else
+            redraw();
 #endif
-	break;
+        }
+        /* Update renderer from surface and present */
+        {
+            SDL_Texture* texture = SDL_CreateTextureFromSurface(TheRenderer, TheSurf);
+            if (texture) {
+                SDL_RenderClear(TheRenderer);
+                SDL_RenderCopy(TheRenderer, texture, NULL, NULL);
+                SDL_RenderPresent(TheRenderer);
+                SDL_DestroyTexture(texture);
+            }
+        }
+        break;
     case SDL_QUIT:
-	sdlgr_display_close(WAIT);
-	Exit(USERABORT);
+        sdlgr_display_close(WAIT);
+        Exit(USERABORT);
     }
 }
 
 /* Handle special key strokes: CTRL-C, CTRL-BREAK, ALT-RETURN.
  * Returns 1 if the key is handled, and 0 otherwise.  */
 static int
-special_keyhandler(const SDL_keysym *s)
+special_keyhandler(const SDL_Keysym *s)
 {
     /* Process CTRL-C, CTRL-BREAK */
     if (any_set(s->mod, KMOD_CTRL)
 	&& (s->sym == SDLK_c
-	    || s->sym==SDLK_BREAK))
+	    || s->sym==SDLK_PAUSE))
     {
 	SDL_Event e;
 	e.type = SDL_QUIT;
@@ -3315,7 +3344,13 @@ special_keyhandler(const SDL_keysym *s)
 	 || any_set(s->mod, KMOD_MODE))
 	&& (s->sym == SDLK_RETURN))
     {
-	SDL_WM_ToggleFullScreen(TheSurf);
+	/* Toggle fullscreen using window flags */
+	Uint32 flags = SDL_GetWindowFlags(TheWindow);
+	if (flags & SDL_WINDOW_FULLSCREEN) {
+	    SDL_SetWindowFullscreen(TheWindow, 0);
+	} else {
+	    SDL_SetWindowFullscreen(TheWindow, SDL_WINDOW_FULLSCREEN_DESKTOP);
+	}
 	return 1;
     }
     return 0;
@@ -3324,7 +3359,7 @@ special_keyhandler(const SDL_keysym *s)
 
 /** Deal with keypad and other conversion weirdness. */
 static void
-normalise_keysym(SDL_keysym *s)
+normalise_keysym(SDL_Keysym *s)
 {
     int num = any_set(s->mod, KMOD_NUM);
 
@@ -3341,47 +3376,47 @@ normalise_keysym(SDL_keysym *s)
 
     /* Keypad */
     switch (s->sym) {
-    case SDLK_KP0:
-	if (num) { s->sym = s->unicode = '0'; } else { s->sym = SDLK_INSERT; }
+    case SDLK_KP_0:
+	if (num) { s->sym = s->sym = '0'; } else { s->sym = SDLK_INSERT; }
 	break;
-    case SDLK_KP1:
-	if (num) { s->sym = s->unicode = '1'; } else { s->sym = SDLK_END; }
+    case SDLK_KP_1:
+	if (num) { s->sym = s->sym = '1'; } else { s->sym = SDLK_END; }
 	break;
-    case SDLK_KP2:
-	if (num) { s->sym = s->unicode = '2'; } else { s->sym = SDLK_DOWN; }
+    case SDLK_KP_2:
+	if (num) { s->sym = s->sym = '2'; } else { s->sym = SDLK_DOWN; }
 	break;
-    case SDLK_KP3:
-	if (num) { s->sym = s->unicode = '3'; } else { s->sym = SDLK_PAGEDOWN;}
+    case SDLK_KP_3:
+	if (num) { s->sym = s->sym = '3'; } else { s->sym = SDLK_PAGEDOWN;}
 	break;
-    case SDLK_KP4:
-	if (num) { s->sym = s->unicode = '4'; } else { s->sym = SDLK_LEFT; }
+    case SDLK_KP_4:
+	if (num) { s->sym = s->sym = '4'; } else { s->sym = SDLK_LEFT; }
 	break;
-    case SDLK_KP5:
-	if (num) { s->sym = s->unicode = '5'; }
+    case SDLK_KP_5:
+	if (num) { s->sym = s->sym = '5'; }
 	break;
-    case SDLK_KP6:
-	if (num) { s->sym = s->unicode = '6'; } else { s->sym = SDLK_RIGHT; }
+    case SDLK_KP_6:
+	if (num) { s->sym = s->sym = '6'; } else { s->sym = SDLK_RIGHT; }
 	break;
-    case SDLK_KP7:
-	if (num) { s->sym = s->unicode = '7'; } else { s->sym = SDLK_HOME; }
+    case SDLK_KP_7:
+	if (num) { s->sym = s->sym = '7'; } else { s->sym = SDLK_HOME; }
 	break;
-    case SDLK_KP8:
-	if (num) { s->sym = s->unicode = '8'; } else { s->sym = SDLK_UP; }
+    case SDLK_KP_8:
+	if (num) { s->sym = s->sym = '8'; } else { s->sym = SDLK_UP; }
 	break;
-    case SDLK_KP9:
-	if (num) { s->sym = s->unicode = '9'; } else { s->sym = SDLK_PAGEUP; }
+    case SDLK_KP_9:
+	if (num) { s->sym = s->sym = '9'; } else { s->sym = SDLK_PAGEUP; }
 	break;
     }
 
 }
 
-/* Convert a key from a SDL_keysym structure to ASCII.  Returns 0 if
+/* Convert a key from a SDL_Keysym structure to ASCII.  Returns 0 if
 * the key isn't an ASCII character, and the character otherwise. */
 static char
-conv_key(const SDL_keysym *s)
+conv_key(const SDL_Keysym *s)
 {
-    if (s->unicode >= 128) { return 0; } /* non-ASCII */
-    if (any_set(s->mod, KMOD_CTRL | KMOD_LALT | KMOD_META)) { 
+    if (s->sym >= 128) { return 0; } /* non-ASCII */
+    if (any_set(s->mod, KMOD_CTRL | KMOD_LALT | KMOD_GUI)) { 
 	return 0;		/* special, modified */
     }
     switch (s->sym) {
@@ -3396,17 +3431,17 @@ conv_key(const SDL_keysym *s)
     case SDLK_ESCAPE:
 	return 27;			/* ASCII for escape. */
     default:
-	return s->unicode;
+	return s->sym;
     }
     return 0;
 }
 
 static void
-print_keysym(const SDL_keysym *s)
+print_keysym(const SDL_Keysym *s)
 {
     fprintf(stderr,"sym: %d, unicode: %d '%c', mod: %x\n",
-	    s->sym, s->unicode,
-	    isgraph(s->unicode) ? s->unicode : '.',
+	    s->sym, s->sym,
+	    isgraph(s->sym) ? s->sym : '.',
 	    s->mod);
 }
 
@@ -3416,7 +3451,7 @@ print_keysym(const SDL_keysym *s)
  * name of the key in the form " m <modifiers><keyname>\n" in the
  * buffer BUF.  Returns 1 if an expansion was made, and 0 if not. */
 static int
-macro_key(const SDL_keysym *s, char *buf, int maxbuf)
+macro_key(const SDL_Keysym *s, char *buf, int maxbuf)
 {
     char name[MAXALLCHAR];
     int ok = 0;
@@ -3431,7 +3466,7 @@ macro_key(const SDL_keysym *s, char *buf, int maxbuf)
     if (any_set(s->mod, KMOD_LALT)) {
 	xstrncat(name, "alt-", n); modified = 1;
     }
-    if (any_set(s->mod, KMOD_META)) {
+    if (any_set(s->mod, KMOD_GUI)) {
 	xstrncat(name, "meta-", n); modified = 1;
     }
 
@@ -3479,8 +3514,8 @@ macro_key(const SDL_keysym *s, char *buf, int maxbuf)
 
     default:
 	if (modified) {
-	    if (isgraph(s->unicode)) {
-		xstrnapp(name, s->unicode, n); ok=1;
+	    if (isgraph(s->sym)) {
+		xstrnapp(name, s->sym, n); ok=1;
 	    }
 	    else if (s->sym >= 33 && s->sym < 128) {
 		xstrnapp(name, s->sym, n); ok=1;
@@ -3520,7 +3555,7 @@ sdlgr_gets(char *buf, int maxbuf, const char *prompt)
 	refresh_layout(TextPanels[i]->layout);
     }
 
-    SDL_WarpMouse(xkoord(curAddr), ykoord(curAddr));
+    SDL_WarpMouseInWindow(TheWindow, xkoord(curAddr), ykoord(curAddr));
 
     /* Process events until we have input to pass back. */
     while (!done) {
@@ -3853,8 +3888,8 @@ sdlgr_open_graphics(void)
 	exit_panic(failedSDLInit, SDL_GetError());
     }
     TheSurf = NULL;
-    SDL_EnableKeyRepeat(SDL_DEFAULT_REPEAT_DELAY, SDL_DEFAULT_REPEAT_INTERVAL);
-    SDL_EnableUNICODE(1);
+    /* Key repeat is handled automatically in SDL2 */
+    /* Unicode input is handled via SDL_TEXTINPUT events in SDL2 */
 
     /* Decode -mode argument. */
     modestr = sdlgr_Storage[0] ? sdlgr_Storage[0] : "";

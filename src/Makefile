@@ -18,13 +18,13 @@ CC = gcc			# req. for linux
 # (8)   -DSDLGRAPHX     1                   SDL graphics (generic)
 
 #DBG = -g -W -Wall -pg
-CFLAGS = -O4 -fomit-frame-pointer $(DBG) -DSERVER -DEXT94 -DPERMUTATE $(INC)
+CFLAGS = -O3 -fomit-frame-pointer $(DBG) -DSDLGRAPHX -DEXT94 -DPERMUTATE $(INC)
 LFLAGS = -x
 # LIB = -lcurses -ltermlib		# enable this one for curses display
 # LIB = -lvgagl -lvga			# enable this one for Linux/SVGA
 # LIB = -L/usr/X11R6/lib -lX11		# enable this one for X11
-# INC = `sdl-config --cflags`		# enable this one for SDL graphics
-# LIB = `sdl-config --libs`		# enable this one for SDL graphics
+INC = `sdl2-config --cflags`		# enable this one for SDL graphics
+LIB = `sdl2-config --libs`		# enable this one for SDL graphics
 
 EXESUFFIX=
 .SUFFIXES: .o .c .c~ .man .doc .6
