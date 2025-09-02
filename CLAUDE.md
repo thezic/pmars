@@ -22,6 +22,13 @@ The Makefile is currently configured with SDL2 graphics support with the followi
 
 The SDL graphics code has been successfully upgraded from SDL1 to SDL2 compatibility.
 
+**SDL2 Rendering Optimizations (2024-09-02):**
+- Fixed visual corruption issues by implementing proper texture management
+- Uses renderer-compatible pixel formats to avoid format conversion artifacts
+- Efficient partial screen updates with texture locking
+- Single persistent texture instead of create/destroy pattern
+- Proper surface-to-texture synchronization
+
 ## Architecture
 
 ### Core Components
