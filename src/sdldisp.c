@@ -1664,7 +1664,7 @@ choose_sizes(
     Uint32 percentage,			/* percentage alloted to B. */
     Uint32 amin, Uint32 amax,		/* bounds for A. */
     Uint32 bmin, Uint32 bmax,		/* bounds for B. */
-    int *wa,  int *wb)		/* result pointers. */
+    Uint16 *wa,  Uint16 *wb)		/* result pointers. */
 {
     if (w > amax + bmax) { 
 	*wa = amax;
